@@ -76,8 +76,11 @@ func checkPorts(config *PortMapConf, containerNet net.IPNet) error {
 	return nil
 }
 
-func forwardPorts(config *PortMapConf, containerNet net.IPNet) ([]string, error) {
-	var res []string
+// forwardPorts returns the translation rules and the filter rules for the
+// container's port mappings. pf needs all translation rules of an anchor
+// before its filter rules.
+func forwardPorts(config *PortMapConf, containerNet net.IPNet) ([]string, []string, error) {
+	var res, filter []string
 	containerIP := containerNet.IP.String()
 
 	// Determine container's address family
@@ -94,7 +97,7 @@ func forwardPorts(config *PortMapConf, containerNet net.IPNet) ([]string, error)
 			// Parse the host IP to determine if it's IPv4 or IPv6
 			hostIPParsed := net.ParseIP(pmap.HostIP)
 			if hostIPParsed == nil {
-				return nil, fmt.Errorf("invalid host IP: %s", pmap.HostIP)
+				return nil, nil, fmt.Errorf("invalid host IP: %s", pmap.HostIP)
 			}
 
 			// Check if host IP family matches container IP family
@@ -111,19 +114,31 @@ func forwardPorts(config *PortMapConf, containerNet net.IPNet) ([]string, error)
 		if hostIP == "" {
 			hostIP = "self"
 		}
+		proto := strings.ToLower(pmap.Protocol)
+		if proto == "" {
+			proto = "tcp"
+		}
 
 		res = append(res,
 			fmt.Sprintf(
 				"rdr pass %s proto %s from any to %s port %d -> %s port %d",
-				containerAF, pmap.Protocol, hostIP, pmap.HostPort, containerIP, pmap.ContainerPort))
+				containerAF, proto, hostIP, pmap.HostPort, containerIP, pmap.ContainerPort))
 		if *config.SNAT {
 			res = append(res,
 				fmt.Sprintf(
 					"nat on %s %s proto %s from (lo0) to %s port %d -> (%s)",
-					config.BrName, containerAF, pmap.Protocol, containerIP, pmap.ContainerPort, config.BrName))
+					config.BrName, containerAF, proto, containerIP, pmap.ContainerPort, config.BrName))
 		}
+		// rdr only applies to packets arriving on an interface. The
+		// host's own connections to the port (to 127.0.0.1 or one of
+		// its addresses) go out through lo0 unredirected, so redirect
+		// them there, on output (FreeBSD 15 rdr-to on a filter rule).
+		filter = append(filter,
+			fmt.Sprintf(
+				"pass out quick on lo0 %s proto %s from any to %s port %d rdr-to %s port %d",
+				containerAF, proto, hostIP, pmap.HostPort, containerIP, pmap.ContainerPort))
 	}
-	return res, nil
+	return res, filter, nil
 }
 
 func unforwardPorts(config *PortMapConf) error {
@@ -145,24 +160,26 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	netConf.ContainerID = args.ContainerID
-	var rules []string
+	var rules, filter []string
 
 	if netConf.ContIPv4.IP != nil {
-		rules4, err := forwardPorts(netConf, netConf.ContIPv4)
+		rules4, filter4, err := forwardPorts(netConf, netConf.ContIPv4)
 		if err != nil {
 			return err
 		}
 		rules = append(rules, rules4...)
+		filter = append(filter, filter4...)
 	}
 
 	if netConf.ContIPv6.IP != nil {
-		rules6, err := forwardPorts(netConf, netConf.ContIPv6)
+		rules6, filter6, err := forwardPorts(netConf, netConf.ContIPv6)
 		if err != nil {
 			return err
 		}
 		rules = append(rules, rules6...)
+		filter = append(filter, filter6...)
 	}
-	rules = append(rules, "")
+	rules = append(append(rules, filter...), "")
 
 	input := strings.Join(rules, "\n")
 	cmd := exec.Command("pfctl", "-a", "cni-rdr/"+args.ContainerID[:32], "-f", "-")
@@ -187,8 +204,15 @@ func cmdDel(args *skel.CmdArgs) error {
 		return nil
 	}
 
-	cmd := exec.Command("pfctl", "-a", "cni-rdr/"+args.ContainerID[:32], "-F", "nat")
-	return cmd.Run()
+	// Translation and filter rules; "-F all" would also flush the
+	// global state table.
+	anchor := "cni-rdr/" + args.ContainerID[:32]
+	for _, what := range []string{"nat", "rules"} {
+		if out, err := exec.Command("pfctl", "-a", anchor, "-F", what).CombinedOutput(); err != nil {
+			return fmt.Errorf("pfctl -a %s -F %s: %v: %s", anchor, what, err, out)
+		}
+	}
+	return nil
 }
 
 func main() {
